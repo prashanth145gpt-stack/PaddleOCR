@@ -1,0 +1,6 @@
+paddleocr==2.7.3
+paddlepaddle==2.6.2
+fastapi==0.123.2
+PyMuPDF==1.27.2
+uvicorn[standard]==0.38.0
+numpy==1.26.4
