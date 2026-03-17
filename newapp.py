@@ -109,11 +109,7 @@ async def extract_ocr(file: UploadFile = File(...)):
         # Cleanup
         Path(tmp_path).unlink(missing_ok=True)
 
-        return {
-            "extracted_text": text
-        }
+        return (text)
 
     except Exception as e:
-        return {
-            "extracted_text": f"Couldn't extract text from the document: {str(e)}"
-        }
+        return ("Couldn't extract text from the document: {str(e)}")
