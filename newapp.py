@@ -1,16 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel, Field, validator
 from paddleocr import PaddleOCR
 import fitz  # PyMuPDF
 from pathlib import Path
 import tempfile
-import shutil
 
 app = FastAPI(title="PDF OCR Extractor API")
 
 
 # -----------------------------
-# Pydantic Request Validation
+# Pydantic Config (Internal Validation)
 # -----------------------------
 class OCRConfig(BaseModel):
     dpi: int = Field(default=300, ge=72, le=600)
@@ -26,18 +25,22 @@ class OCRConfig(BaseModel):
 
 
 # -----------------------------
-# Core OCR Logic (UNCHANGED)
+# Initialize OCR ONCE (IMPORTANT)
+# -----------------------------
+ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+
+
+# -----------------------------
+# Core OCR Logic (UNCHANGED FLOW)
 # -----------------------------
 def pdf_to_text_with_paddle(pdf_path, dpi=300, lang='en', conf_threshold=0.5, max_pages=None):
     pdf_path = str(pdf_path)
-    ocr = PaddleOCR(use_angle_cls=True, lang=lang, show_log=False)
 
     doc = fitz.open(pdf_path)
     total_pages = len(doc)
     pages = range(total_pages) if max_pages is None else range(min(max_pages, total_pages))
 
     all_text = []
-    page_summaries = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -65,45 +68,37 @@ def pdf_to_text_with_paddle(pdf_path, dpi=300, lang='en', conf_threshold=0.5, ma
 
             all_text.append(f"PAGE {i+1}\n{page_text}")
 
-            page_summaries.append({
-                "page": i + 1,
-                "lines_detected": len(lines),
-                "lines_kept(>=thr)": len(good_lines),
-                "ok": len(good_lines) > 0
-            })
-
     doc.close()
     full_text = "\n\n".join(all_text).rstrip()
-    return full_text, page_summaries
+    return full_text
 
 
 # -----------------------------
 # API Endpoint
 # -----------------------------
 @app.post("/extract-ocr")
-async def extract_ocr(
-    file: UploadFile = File(...),
-    dpi: int = 300,
-    lang: str = "en",
-    conf_threshold: float = 0.5,
-    max_pages: int | None = None
-):
+async def extract_ocr(file: UploadFile = File(...)):
     try:
-        # Validate config
+        # Default configs (hidden from Swagger)
         config = OCRConfig(
-            dpi=dpi,
-            lang=lang,
-            conf_threshold=conf_threshold,
-            max_pages=max_pages
+            dpi=300,
+            lang="en",
+            conf_threshold=0.5,
+            max_pages=None
         )
 
-        # Save file
+        # Read uploaded file safely
+        contents = await file.read()
+        if not contents:
+            return {"extracted_text": "Empty file uploaded"}
+
+        # Save temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            shutil.copyfileobj(file.file, tmp)
+            tmp.write(contents)
             tmp_path = tmp.name
 
-        # OCR
-        text, _ = pdf_to_text_with_paddle(
+        # Run OCR
+        text = pdf_to_text_with_paddle(
             tmp_path,
             dpi=config.dpi,
             lang=config.lang,
@@ -111,11 +106,14 @@ async def extract_ocr(
             max_pages=config.max_pages
         )
 
+        # Cleanup
         Path(tmp_path).unlink(missing_ok=True)
 
-        return (text)
+        return {
+            "extracted_text": text
+        }
 
-    except Exception:
-        return (
-            "Couldn't extract text from the document"
-        )
+    except Exception as e:
+        return {
+            "extracted_text": f"Couldn't extract text from the document: {str(e)}"
+        }
