@@ -1,52 +1,33 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field, validator
 from paddleocr import PaddleOCR
 import fitz  # PyMuPDF
 from pathlib import Path
 import tempfile
-from typing import Optional, List
+import shutil
 
 app = FastAPI(title="PDF OCR Extractor API")
 
 
-# ---------------------------
-# Pydantic Request Model
-# ---------------------------
-class OCRRequest(BaseModel):
-    pdf_path: str = Field(..., description="Absolute path to PDF file")
-    dpi: int = Field(300, ge=72, le=600)
-    lang: str = Field("en")
-    conf_threshold: float = Field(0.5, ge=0.0, le=1.0)
-    max_pages: Optional[int] = Field(None, ge=1)
+# -----------------------------
+# Pydantic Request Validation
+# -----------------------------
+class OCRConfig(BaseModel):
+    dpi: int = Field(default=300, ge=72, le=600)
+    lang: str = "en"
+    conf_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    max_pages: int | None = Field(default=None, ge=1)
 
-    @validator("pdf_path")
-    def validate_pdf_path(cls, v):
-        if not Path(v).exists():
-            raise ValueError("PDF file does not exist")
-        if not v.lower().endswith(".pdf"):
-            raise ValueError("File must be a PDF")
+    @validator("lang")
+    def validate_lang(cls, v):
+        if not v:
+            raise ValueError("Language cannot be empty")
         return v
 
 
-# ---------------------------
-# Response Model
-# ---------------------------
-class PageSummary(BaseModel):
-    page: int
-    lines_detected: int
-    lines_kept: int
-    ok: bool
-
-
-class OCRResponse(BaseModel):
-    extracted_text: str
-    summary: List[PageSummary]
-    message: str
-
-
-# ---------------------------
-# Core Logic (UNCHANGED)
-# ---------------------------
+# -----------------------------
+# Core OCR Logic (UNCHANGED)
+# -----------------------------
 def pdf_to_text_with_paddle(pdf_path, dpi=300, lang='en', conf_threshold=0.5, max_pages=None):
     pdf_path = str(pdf_path)
     ocr = PaddleOCR(use_angle_cls=True, lang=lang, show_log=False)
@@ -63,8 +44,10 @@ def pdf_to_text_with_paddle(pdf_path, dpi=300, lang='en', conf_threshold=0.5, ma
 
         for i in pages:
             page = doc[i]
+
             mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
             pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
+
             img_path = tmpdir / f"page_{i+1:04d}.png"
             pix.save(img_path.as_posix())
 
@@ -85,7 +68,7 @@ def pdf_to_text_with_paddle(pdf_path, dpi=300, lang='en', conf_threshold=0.5, ma
             page_summaries.append({
                 "page": i + 1,
                 "lines_detected": len(lines),
-                "lines_kept": len(good_lines),
+                "lines_kept(>=thr)": len(good_lines),
                 "ok": len(good_lines) > 0
             })
 
@@ -94,41 +77,45 @@ def pdf_to_text_with_paddle(pdf_path, dpi=300, lang='en', conf_threshold=0.5, ma
     return full_text, page_summaries
 
 
-# ---------------------------
+# -----------------------------
 # API Endpoint
-# ---------------------------
-@app.post("/extract-text", response_model=OCRResponse)
-def extract_text(request: OCRRequest):
+# -----------------------------
+@app.post("/extract-ocr")
+async def extract_ocr(
+    file: UploadFile = File(...),
+    dpi: int = 300,
+    lang: str = "en",
+    conf_threshold: float = 0.5,
+    max_pages: int | None = None
+):
     try:
-        text, summary = pdf_to_text_with_paddle(
-            pdf_path=request.pdf_path,
-            dpi=request.dpi,
-            lang=request.lang,
-            conf_threshold=request.conf_threshold,
-            max_pages=request.max_pages
+        # Validate config
+        config = OCRConfig(
+            dpi=dpi,
+            lang=lang,
+            conf_threshold=conf_threshold,
+            max_pages=max_pages
         )
 
-        if not text.strip():
-            return OCRResponse(
-                extracted_text="",
-                summary=summary,
-                message="Could not extract meaningful text from the document"
-            )
+        # Save file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
 
-        return OCRResponse(
-            extracted_text=text,
-            summary=summary,
-            message="Extraction successful"
+        # OCR
+        text, _ = pdf_to_text_with_paddle(
+            tmp_path,
+            dpi=config.dpi,
+            lang=config.lang,
+            conf_threshold=config.conf_threshold,
+            max_pages=config.max_pages
         )
 
-    except ValueError as ve:
-        # Validation-level issues
-        raise HTTPException(status_code=400, detail=str(ve))
+        Path(tmp_path).unlink(missing_ok=True)
 
-    except Exception as e:
-        # Replace 500 with controlled response
-        return OCRResponse(
-            extracted_text="",
-            summary=[],
-            message=f"Could not extract text due to processing issue: {str(e)}"
+        return (text)
+
+    except Exception:
+        return (
+            "Couldn't extract text from the document"
         )
